@@ -7,7 +7,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <ArduinoJson.h>
-
+#include <esp_task_wdt.h>  // Watchdog timer
 
 // MQTT
 const char* mqtt_host = "mqtt.lunka.io";
@@ -22,6 +22,10 @@ const char* topic_humidity = "groupA/humidity";
 const char* topic_command = "cmd/digital";
 const char* topic_relay = "ba12512b-6575-44f1-8b09-fd26eea66817/pin/19/state";
 
+// reCamera topics (NEW)
+const char* topic_plant_stage = "smartfarm/plant_stage";
+const char* topic_water_mode = "smartfarm/water_mode";
+const char* topic_harvest_alert = "smartfarm/harvest_alert";
 
 // ================= DHT22 =================
 
@@ -102,6 +106,12 @@ const unsigned long wifiResetHoldTime=3000;
 unsigned long wifiResetPressMillis=0;
 bool wifiResetInProgress=false;
 
+// reCamera integration state (NEW)
+bool harvestAlert = false;
+String waterMode = "light";
+float onThreshold = 30;
+float offThreshold = 70;
+
 WiFiClientSecure net;
 PubSubClient client(net);
 
@@ -125,6 +135,10 @@ void reconnectMQTT() {
     if (client.connect(mqtt_client_id, mqtt_username, mqtt_password)) {
       Serial.println("MQTT Connected!");
       client.subscribe(topic_command);
+      // NEW: Subscribe to reCamera topics
+      client.subscribe(topic_plant_stage);
+      client.subscribe(topic_water_mode);
+      client.subscribe(topic_harvest_alert);
     } else {
       Serial.print("Failed, rc=");
       Serial.print(client.state());
@@ -150,10 +164,27 @@ void sendSensorData(float temperature, float humidity, float moisture) {
   }
 }
 
+// NEW: Apply water mode from reCamera
+void applyWaterMode(String mode) {
+  waterMode = mode;
+  if (mode == "increase") {
+    onThreshold = 40;
+    offThreshold = 80;
+  } else if (mode == "maintain") {
+    onThreshold = 30;
+    offThreshold = 70;
+  } else if (mode == "harvest") {
+    onThreshold = 101;
+    offThreshold = 101;
+  } else {
+    onThreshold = 30;
+    offThreshold = 70;
+  }
+}
+
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String message;
   for (unsigned int i = 0; i < length; i++) message += (char)payload[i];
-
 
   Serial.println("---- [DEBUG] MQTT Callback ----");
   Serial.print("[MQTT RECEIVE] topic: ");
@@ -194,7 +225,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       Serial.println(pin);
     }
 
-
     char buffer[2];
     sprintf(buffer, "%d", relayState ? 1 : 0);
     Serial.print("[DEBUG] Publish state to MQTT: ");
@@ -202,6 +232,46 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     Serial.print(" payload: ");
     Serial.println(buffer);
     client.publish(topic_relay, buffer);
+  }
+  // NEW: Handle reCamera topics
+  else if (String(topic) == topic_water_mode) {
+    StaticJsonDocument<64> doc;
+    if (!deserializeJson(doc, message)) {
+      applyWaterMode(doc.as<String>());
+    } else {
+      applyWaterMode(message);
+    }
+    Serial.print("[reCamera] Water mode: ");
+    Serial.println(waterMode);
+  }
+  else if (String(topic) == topic_harvest_alert) {
+    StaticJsonDocument<64> doc;
+    if (!deserializeJson(doc, message)) {
+      harvestAlert = doc.as<bool>();
+    } else {
+      harvestAlert = (message == "true" || message == "1");
+    }
+    if (harvestAlert) {
+      digitalWrite(RELAY_PIN, LOW);
+      relayState = false;
+      Serial.println("[reCamera] Harvest alert - pump OFF");
+    }
+    Serial.print("[reCamera] Harvest alert: ");
+    Serial.println(harvestAlert ? "true" : "false");
+  }
+  else if (String(topic) == topic_plant_stage) {
+    StaticJsonDocument<64> doc;
+    if (!deserializeJson(doc, message)) {
+      int stage = doc.as<int>();
+      if (stage >= 1 && stage <= 4) {
+        if (stage == 4) applyWaterMode("harvest");
+        else if (stage == 3) applyWaterMode("maintain");
+        else if (stage == 2) applyWaterMode("increase");
+        else applyWaterMode("light");
+        Serial.print("[reCamera] Plant stage: ");
+        Serial.println(stage);
+      }
+    }
   }
   Serial.println("------ END DEBUG ------");
 }
@@ -223,6 +293,7 @@ while(true);
 display.clearDisplay();
 display.setTextColor(SSD1306_WHITE);
 
+
 pinMode(LED1_PIN,OUTPUT);
 pinMode(LED2_PIN,OUTPUT);
 pinMode(LED3_PIN,OUTPUT);
@@ -232,6 +303,7 @@ for(int i=0;i<ledCount;i++)
 {
 digitalWrite(ledPins[i],LOW);
 }
+
 
 pinMode(RELAY_PIN,OUTPUT);
 pinMode(BUTTON_PIN,INPUT_PULLUP);
@@ -244,16 +316,29 @@ net.setInsecure();
 client.setServer(mqtt_host,mqtt_port);
 client.setCallback(mqttCallback);
 
+// NEW: Watchdog timer (ESP-IDF v5.0+ API)
+esp_task_wdt_config_t wdt_config = {
+  .timeout_ms = 30000,
+  .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+  .trigger_panic = true
+};
+esp_task_wdt_init(&wdt_config);
+esp_task_wdt_add(NULL);
+
 }
 
 unsigned long time_count=0;
 unsigned long timer=60000;
 int cc = 0;
+unsigned long lastMqttReconnect = 0;
 
 
 void loop()
 {
-//================ WIFI RESET =================
+  // Feed watchdog
+  esp_task_wdt_reset();
+
+  // ================ WIFI RESET =================
   if (digitalRead(WIFI_RESET_PIN) == HIGH) {
     if (!wifiResetInProgress) {
       wifiResetPressMillis = millis();
@@ -271,65 +356,51 @@ void loop()
     wifiResetInProgress = false;
   }
 
-//================ MQTT =================
-
-  // if (!client.connected()) {
-  //   reconnectMQTT();
-  // }
-  // client.loop();
-
-if(WiFi.status()==WL_CONNECTED)
-{
-  if(!client.connected())
-  {
-    reconnectMQTT();
+  // ================ MQTT =================
+  // Non-blocking reconnect (NEW)
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!client.connected()) {
+      unsigned long now = millis();
+      if (now - lastMqttReconnect >= 5000) {
+        lastMqttReconnect = now;
+        reconnectMQTT();
+      }
+    }
+    client.loop();
   }
-  client.loop();
-}
 
-//================ DHT22 & Soil =================
+  // ================ DHT22 & Soil =================
   temperature = dht.readTemperature();
   humidity = dht.readHumidity();
   
-  sensor_analog= analogRead(sensor_pin);
-  //moisture = sensor_analog;
+  sensor_analog = analogRead(sensor_pin);
   moisture = ((4095.00 - sensor_analog)/(4095.00-500)) * 100; 
 
-  if(moisture > 100)
-  moisture = 100;
-  if(moisture < 0)
-  moisture = 0;
+  if (moisture > 100) moisture = 100;
+  if (moisture < 0) moisture = 0;
 
   Serial.print(sensor_analog);
   Serial.print(":");
-  Serial.print(moisture);  /* Print Temperature on the serial window */
+  Serial.print(moisture);
   Serial.println("%");
-  delay(1000); 
 
-
-//================ AUTO PUMP =================
-
-if(autoPump==true  && manualControl==false && !isnan(temperature) && !isnan(humidity))
-{
-
-  if(temperature > NORMAL_TEMP && humidity < NORMAL_HUMI)
+  // ================ AUTO PUMP =================
+  // Updated to use soil moisture thresholds from reCamera (NEW)
+  if (autoPump == true && manualControl == false && !isnan(temperature) && !isnan(humidity) && !harvestAlert)
   {
-  digitalWrite(RELAY_PIN,HIGH);
-  relayState=true;
-  Serial.println("Auto PUMP ON");
-  }
-  else
-  {
-  digitalWrite(RELAY_PIN,LOW);
-  relayState=false;
-  Serial.println("Auto PUMP OFF");
+    if (moisture < onThreshold) {
+      digitalWrite(RELAY_PIN, HIGH);
+      relayState = true;
+      Serial.println("Auto PUMP ON (soil dry)");
+    }
+    else if (moisture > offThreshold) {
+      digitalWrite(RELAY_PIN, LOW);
+      relayState = false;
+      Serial.println("Auto PUMP OFF (soil wet)");
+    }
   }
 
-}
-
-
-//================ LED RUN =================
-
+  // ================ LED RUN =================
   if (millis() - previousLedMillis >= ledInterval) {
     previousLedMillis = millis();
     for (int i = 0; i < ledCount; i++) {
@@ -339,12 +410,12 @@ if(autoPump==true  && manualControl==false && !isnan(temperature) && !isnan(humi
     ledIndex++;
     if (ledIndex >= ledCount) ledIndex = 0;
   }
-//================ Manual Button =================
 
-  if (digitalRead(BUTTON_PIN) == HIGH) {   // LOW = กด (pullup logic)
+  // ================ Manual Button =================
+  // Button is INPUT_PULLUP, so LOW = pressed
+  if (digitalRead(BUTTON_PIN) == LOW) {   
     unsigned long now = millis();
     if (now - lastButtonPress > debounceDelay) {
-      // เริ่มจับเวลา
       manualControl = true;
       manualStartTime = millis();
 
@@ -360,55 +431,54 @@ if(autoPump==true  && manualControl==false && !isnan(temperature) && !isnan(humi
     }
   }
 
-//================ Manual Timeout =================
-
-
-if(manualControl == true)
-{
-  if(millis() - manualStartTime >= manualTimeout)
+  // ================ Manual Timeout =================
+  if (manualControl == true)
   {
-    manualControl = false;
-    Serial.println("Manual Timeout -> AUTO MODE");
+    if (millis() - manualStartTime >= manualTimeout)
+    {
+      manualControl = false;
+      Serial.println("Manual Timeout -> AUTO MODE");
+    }
   }
-}
 
-//================ OLED =================
+  // ================ OLED =================
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.setTextSize(1);
+  display.print("Temp:");
+  display.setTextSize(2);
+  display.print(temperature,1);
+  display.println("C");
+  display.setTextSize(1);
+  display.print("Humi:");
+  display.setTextSize(2);
+  display.print(humidity,1);
+  display.println("%");
+  display.setTextSize(1);
+  display.print("Soil:");
+  display.print(moisture,1);
+  display.println("%");
+  display.print("Pump:");
 
+  if (relayState)
+    display.println("ON");
+  else
+    display.println("OFF");
+  
+  // NEW: Show water mode
+  display.setTextSize(1);
+  display.print("Mode:");
+  display.println(waterMode);
+  
+  display.print("CAMT Smart Farm");
+  display.display();
 
-display.clearDisplay();
-display.setCursor(0,0);
-display.setTextSize(1);
-display.print("Temp:");
-display.setTextSize(2);
-display.print(temperature,1);
-display.println("C");
-display.setTextSize(1);
-display.print("Humi:");
-display.setTextSize(2);
-display.print(humidity,1);
-display.println("%");
-display.setTextSize(1);
-display.print("Soil:");
-display.print(moisture,1);
-display.println("%");
-display.print("Pump:");
+  // ================ MQTT Send =================
+  if (millis() - time_count >= timer) {
+    sendSensorData(temperature, humidity, moisture);
+    time_count = millis();
+  }
 
-if(relayState)
-
-display.println("ON");
-
-else
-
-display.println("OFF");
-display.print("CAMT Smart Farm"); // แสดงผลข้อความ
-display.display();
-
-
-//================ MQTT Send =================
-
-if(millis()-time_count>=timer){
-sendSensorData(temperature,humidity,moisture);
-time_count=millis();
-}
-
+  // Small delay to prevent watchdog issues
+  delay(100);
 }
