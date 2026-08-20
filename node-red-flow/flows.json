@@ -1814,7 +1814,7 @@
         "trace": false,
         "counting": false,
         "draw": false,
-        "classes": "Damaged,Harvest,Vagetative",
+        "classes": "Damaged,Harvest,Vegetative",
         "splitter": "0,0,0,0",
         "previewResolution": "auto",
         "previewFps": "30",
@@ -1867,7 +1867,7 @@
         "z": "35ee92b6dbd194c1",
         "name": "Plant Stage Detection",
         "func": "// Model Classes:\n// 0: Damaged    -> IGNORED\n// 1: Harvest    -> Stage 2 (Harvest)\n// 2: Vegetative -> Stage 1 (Vegetative)\n\nconst CLASS_TO_STAGE = {\n    \"Harvest\": 2,\n    \"Vegetative\": 1,\n    1: 2,   // Class 1 = Harvest  -> Stage 2\n    2: 1    // Class 2 = Veg      -> Stage 1\n};\n\nvar stage_counts = [0, 0, 0];\nvar total_count = 0;\n\nif (msg.payload && msg.payload.boxes) {\n    var boxes = msg.payload.boxes;\n    var labels = msg.payload.labels || [];\n\n    for (var i = 0; i < boxes.length; i++) {\n        var box = boxes[i];\n        if (box[4] === 0) continue;\n\n        var cls = labels[i];\n        var stage = CLASS_TO_STAGE[cls];\n\n        if (stage === 1 || stage === 2) {\n            stage_counts[stage]++;\n            total_count++;\n        }\n    }\n}\n\n// Dominant stage (Harvest priority)\nvar plant_stage = 0;\nif (stage_counts[2] > 0) plant_stage = 2;\nelse if (stage_counts[1] > 0) plant_stage = 1;\n\nvar harvest_alert = (plant_stage === 2);\n\n// Water mode logic\nvar water_mode = \"idle\";\nif (plant_stage === 1) water_mode = \"water\";\nelse if (plant_stage === 2) water_mode = \"harvest\";\n\n// Output array of 3 messages for 3 node outputs\nreturn [\n    { payload: String(plant_stage) },\n    { payload: water_mode },\n    { payload: harvest_alert ? \"true\" : \"false\" }\n];",
-        "outputs": 3,
+        "outputs": 1,
         "timeout": 0,
         "noerr": 0,
         "initialize": "",
@@ -1877,13 +1877,9 @@
         "y": 440,
         "wires": [
             [
-                "ec0801eca896368a"
-            ],
-            [
+                "ec0801eca896368a",
+                "ee0af34c09000723",
                 "c458efc02ebc1fae"
-            ],
-            [
-                "ee0af34c09000723"
             ]
         ]
     },
@@ -1983,7 +1979,7 @@
         "id": "83e91e75a276b7f5",
         "type": "mqtt-broker",
         "name": "recamera_message",
-        "broker": "0.0.0.0",
+        "broker": "localhost",
         "port": 1883,
         "clientid": "609942fa-7cc1-4054-91ba-51d8bdb9c00c",
         "autoConnect": true,
@@ -2047,7 +2043,7 @@
         "disabled": "false"
     },
     {
-        "id": "08c6012b10c1c802",
+        "id": "96bfc8862147cb65",
         "type": "global-config",
         "env": [],
         "modules": {
