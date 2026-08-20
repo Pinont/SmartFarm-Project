@@ -104,6 +104,33 @@ unsigned long lastButtonPress = 0;
 
 const unsigned long debounceDelay = 200;
 
+// ------------------------------------------------------------
+// Relay-toggle noise guard for GPIO17 (Wi-Fi reset button)
+// ------------------------------------------------------------
+//
+// The relay coil is an inductive load. Switching it (pump ON
+// or OFF) can generate a brief voltage/EMI spike, and GPIO17's
+// pull-up is very weak (~45k ohm internal), so that spike can
+// occasionally drag the pin low long enough to look like a
+// genuine long-press if it lands near the relay wiring.
+//
+// We saw this happen in practice: a "GPIO18 -> MANUAL ON" pump
+// toggle was immediately followed by a false Wi-Fi reset, with
+// no HIGH transition logged in between - i.e. a real ~3s low
+// read, not a bounce we failed to catch.
+//
+// This is fundamentally a hardware noise problem (fix: flyback
+// diode across the relay coil, external pull-up + small cap on
+// GPIO17, and keep that wire away from the relay/pump leads).
+// Until that's done, this timestamp gives us a software safety
+// net: any relay state change (see publishRelayState()) resets
+// the Wi-Fi reset timer for a short window, so coincidental
+// noise from a pump toggle can't accumulate into a false reset.
+
+unsigned long relayChangeGuardUntil = 0;
+
+const unsigned long relayChangeGuardWindow = 1000;
+
 // Manual mode timeout
 bool manualControl = false;
 
@@ -112,14 +139,12 @@ unsigned long manualStartTime = 0;
 const unsigned long manualTimeout = 60000;
 
 // ============================================================
-// Auto Pump Button
+// Auto Pump
 // ============================================================
-
-#define AUTO_BUTTON_PIN 5
-
-// IMPORTANT:
-// GPIO5 is only responsible for toggling autoPump.
-// reCamera does NOT change autoPump.
+//
+// No physical button for this in the old code — autoPump
+// stays permanently ON, same as the original sketch.
+//
 
 bool autoPump = true;
 
@@ -188,8 +213,6 @@ void updateDisplay();
 
 void handleButton();
 
-void handleAutoPump();
-
 void handleWiFiReset();
 
 void heartbeatLED();
@@ -218,8 +241,6 @@ void setup() {
     pinMode(RELAY_PIN, OUTPUT);
 
     pinMode(BUTTON_PIN, INPUT_PULLUP);
-
-    pinMode(AUTO_BUTTON_PIN, INPUT_PULLUP);
 
     pinMode(WIFI_RESET_PIN, INPUT_PULLUP);
 
@@ -385,8 +406,6 @@ void loop() {
     // --------------------------------------------------------
 
     handleButton();
-
-    handleAutoPump();
 
     handleWiFiReset();
 
@@ -621,6 +640,14 @@ void callback(
                 );
 
                 publishRelayState();
+
+            } else {
+
+                // Leaving harvest stage: clear the alert here
+                // directly, instead of relying solely on a
+                // separate smartfarm/harvest_alert message
+                // arriving to reset it.
+                harvestAlert = false;
             }
         }
 
@@ -702,8 +729,7 @@ void callback(
 //
 // IMPORTANT:
 // This function DOES NOT modify autoPump.
-//
-// GPIO5 is the only local control for autoPump.
+// autoPump stays permanently ON (no button controls it).
 //
 
 void applyWaterMode(String mode) {
@@ -916,97 +942,6 @@ void handleButton() {
 }
 
 // ============================================================
-// GPIO5 - AUTO PUMP SWITCH
-// ============================================================
-//
-// One physical press:
-//
-// ON  -> OFF
-// OFF -> ON
-//
-// This DOES NOT depend on waterMode.
-//
-// reCamera cannot change autoPump.
-//
-
-void handleAutoPump() {
-
-    static bool lastReading = HIGH;
-
-    static bool stableState = HIGH;
-
-    static unsigned long lastDebounceTime = 0;
-
-    bool reading =
-        digitalRead(AUTO_BUTTON_PIN);
-
-    // Raw change
-    if (
-        reading != lastReading
-    ) {
-
-        lastDebounceTime =
-            millis();
-
-        lastReading =
-            reading;
-    }
-
-    // Debounce
-    if (
-        millis() - lastDebounceTime >=
-        debounceDelay
-    ) {
-
-        // Stable state changed
-        if (
-            reading != stableState
-        ) {
-
-            stableState =
-                reading;
-
-            // Button pressed
-            if (
-                stableState == LOW
-            ) {
-
-                autoPump =
-                    !autoPump;
-
-                Serial.print(
-                    "GPIO5 -> Auto Pump: "
-                );
-
-                Serial.println(
-                    autoPump
-                        ? "ON"
-                        : "OFF"
-                );
-
-                // If automatic mode is disabled,
-                // immediately stop the pump.
-                if (!autoPump) {
-
-                    relayState = false;
-
-                    digitalWrite(
-                        RELAY_PIN,
-                        LOW
-                    );
-
-                    Serial.println(
-                        "Auto Pump OFF -> Pump OFF"
-                    );
-
-                    publishRelayState();
-                }
-            }
-        }
-    }
-}
-
-// ============================================================
 // GPIO17 - WIFI RESET
 // ============================================================
 //
@@ -1025,6 +960,29 @@ void handleWiFiReset() {
     static unsigned long lowStart = 0;
 
     static bool resetTriggered = false;
+
+    // --------------------------------------------------------
+    // Relay-toggle noise guard
+    // --------------------------------------------------------
+    //
+    // Ignore GPIO17 entirely for a short window right after any
+    // relay state change. See the comment above
+    // relayChangeGuardUntil's declaration for why: switching
+    // the pump relay can inject enough noise to falsely read
+    // GPIO17 as held low, which would otherwise wipe the Wi-Fi
+    // credentials. This does NOT fix the underlying noise -
+    // it just stops that specific coincidence from turning into
+    // an accidental reset while the real hardware fix (flyback
+    // diode / external pull-up+cap on GPIO17) is pending.
+
+    if (millis() < relayChangeGuardUntil) {
+
+        lowStart = 0;
+
+        resetTriggered = false;
+
+        return;
+    }
 
     int reading =
         digitalRead(WIFI_RESET_PIN);
@@ -1108,6 +1066,14 @@ void handleWiFiReset() {
 // ============================================================
 
 void publishRelayState() {
+
+    // Start (or restart) the GPIO17 noise-immunity window every
+    // time the relay actually changes state - this is the one
+    // choke point nearly all relay transitions pass through.
+    // See relayChangeGuardUntil's declaration comment for why.
+
+    relayChangeGuardUntil =
+        millis() + relayChangeGuardWindow;
 
     if (!client.connected()) {
         return;
